@@ -1,0 +1,369 @@
+-- Раздел № 1 Перенос данных в хранилице
+-- 1.1. Переносим данные о новых мастерах из внешего источника в d_craftsman
+merge into dwh.d_craftsman t0
+using (select distinct craftsman_name, craftsman_address, craftsman_birthday, craftsman_email from external_source.craft_products_orders) t1
+on t0.craftsman_name = t1.craftsman_name and t0.craftsman_email = t1.craftsman_email 
+when matched then
+update set 
+craftsman_address = t1.craftsman_address,
+craftsman_birthday = t1.craftsman_birthday,
+load_dttm = current_timestamp 
+when not matched then 
+insert (craftsman_name, craftsman_address, craftsman_birthday, craftsman_email, load_dttm)
+values (t1.craftsman_name, t1.craftsman_address, t1.craftsman_birthday, t1.craftsman_email, current_timestamp);
+
+--1.2. Переносим информацию о новых покупателях из внешнего источника в d_customer
+merge into dwh.d_customer t0
+using (select distinct customer_name, customer_address, customer_birthday, customer_email from external_source.customers) t1
+on t0.customer_name = t1.customer_name and t0.customer_email = t1.customer_email 
+when matched then 
+update set 
+customer_address = t1.customer_address, 
+customer_birthday =  t1.customer_birthday,
+load_dttm = current_timestamp
+when not matched then 
+insert (customer_name, customer_address, customer_birthday, customer_email, load_dttm)
+values (t1.customer_name, t1.customer_address, t1.customer_birthday, t1.customer_email, current_timestamp);
+
+--1.3. Переносим информацию о новых продуктах в d_product
+merge into dwh.d_product t0
+using (select distinct product_name, product_description, product_type, product_price from external_source.craft_products_orders) t1
+on t0.product_name = t1.product_name and t0.product_type = t1.product_type and t0.product_price = t1.product_price 
+when matched then 
+update set 
+-- т.к. по сценарным условиям мы присоединяем сторонний сайт к своей информационной системе с дальнейшей полной интеграцией, 
+--то описание товара, совпадающего по названию, типу и цене не изменяем, (хотя я бы зада вопрос по поводу описания руководству)
+load_dttm = current_timestamp 
+when not matched then 
+insert (product_name, product_description, product_type, product_price, load_dttm)
+values (t1.product_name, t1.product_description, t1.product_type, t1.product_price, current_timestamp);
+
+-- 1.4. Переносим информацию о заказах в f_order
+-- 1.4.1 Т.к. продажи идут через два сайта добавляем 2 колонки: 
+--"source_sale" - источник продаж: сайт 1 или сайт 2, 
+-- "id_order_source_2" если продаи идут через сайт 2 добавляем id_order из external_source.craft_products_orders.order_id для прослеживаемости заказ 
+alter table dwh.f_order 
+add source_sale varchar;
+
+alter table dwh.f_order 
+add id_order_source_2 bigint;
+
+-- 1.4.2 Обновляем данные в f_order в части указания информации об источнике продаж source_1
+update dwh.f_order 
+set source_sale = 'source_1';
+
+-- 1.4.3 Добавляем данные о заказах из источника 2. Т.к. заказы уникальны добавляем данные без сравнения.
+insert into dwh.f_order (product_id, craftsman_id, customer_id, order_created_date, order_completion_date, order_status, source_sale, id_order_source_2, load_dttm)
+select distinct product_id, craftsman_id, customer_id, order_created_date, order_completion_date, order_status, 'source_2', order_id, current_timestamp from external_source.craft_products_orders;
+
+
+-- Раздел № 2 создание витрины dwh.customer_report_datamart
+ drop table if exists dwh.customer_report_datamart;
+
+create table if not exists dwh.customer_report_datamart(
+id bigint generated always as identity not null, 			 -- идентификатор записи;
+customer_id bigint not null, 								 -- идентификатор заказчика
+customer_name varchar not null, 							 -- Ф. И. О. заказчика
+customer_address varchar not null,							 -- адрес заказчика
+customer_birthday date not null,							 -- дата рождения заказчика
+customer_email varchar not null,							 -- электронная почта заказчика
+total_spend_money int not null,								 -- сумма, которую потратил заказчик
+platform_money numeric (15, 2) not null, 					 -- сумма, которую заработала платформа от покупок заказчика за месяц (10% от суммы, которую потратил заказчик)
+total_order_count_per_month smallint not null, 				 -- количство заказов одного заказчика за месяц
+avg_cost_one_order numeric (10, 2) not null,				 -- средняя стоимость одного заказа у заказчика за месяц
+median_time_order_completed numeric (10,1),					 -- медианное время в днях от момента создания заказа до его завершения за месяц
+top_product_category varchar not null,						 -- самая популярная категория товаров у этого заказчика за месяц
+top_popular_craftsman_id bigint not null,					 -- идентификатор самого популярного мастера ручной работы у заказчика
+count_order_created bigint not null, 						 -- количество созданных заказов за месяц
+count_order_in_progress bigint not null, 					 -- количество заказов в процессе изготовки за месяц
+count_order_delivery bigint not null, 						 -- количество заказов в доставке за месяц
+count_order_done bigint not null, 							 -- количество завершённых заказов за месяц
+count_order_not_done bigint not null, 						 -- количество незавершённых заказов за месяц
+report_period varchar not null, 							 -- отчётный период год и месяц
+constraint customer_report_datamart_pk primary key (id)
+);
+
+--Раздел № 3 Инкрементальная заргузка данных в customer_report_datamart
+-- 3.1. Создание таблицы для отслеживания даты загрузки данных
+drop table if exists dwh.load_dates_customer_report_datamart;
+
+create table if not exists dwh.load_dates_customer_report_datamart(
+id bigint generated always as identity not null,
+load_dttm date not null,
+constraint load_dates_customer_report_datamart_pk primary key (id)
+);
+
+-- 3.2. Создание алгоритма инкрементальной заргузки данных в customer_report_datamart
+dwh_delta_customer as( -- получем данные, которые были изменены или добавлены
+select
+dc.customer_id as customer_id,
+dc.customer_name as customer_name,
+dc.customer_address as customer_address,
+dc.customer_birthday as customer_birthday,
+dc.customer_email as customer_email,
+dc2.craftsman_id as craftsman_id,
+dp.product_id as product_id,
+dp.product_price as product_price,
+dp.product_type as product_type,
+crd.customer_id as exists_customer_id,
+t0.order_created_date as order_created_date,
+to_char(t0.order_created_date, 'yyyy-mm') as report_period,
+(t0.order_completion_date - t0.order_created_date) as diff_order_date,
+t0.order_status as order_status,
+dc.load_dttm  as customer_load_dttm,
+dc2.load_dttm  as craftsman_load_dttm,
+dp.load_dttm  as product_load_dttm
+from dwh.f_order t0
+	inner join dwh.d_customer dc on t0.customer_id = dc.customer_id 
+	inner join dwh.d_craftsman dc2 on t0.craftsman_id = dc2.craftsman_id 
+	inner join dwh.d_product dp on t0.product_id = dp.product_id 
+	left join dwh.customer_report_datamart crd on dc.customer_id = crd.customer_id
+		where 
+			(dc.load_dttm > (select coalesce (max(load_dttm), '1900-01-01') from dwh.load_dates_customer_report_datamart)) or
+			(dc2.load_dttm > (select coalesce (max(load_dttm), '1900-01-01') from dwh.load_dates_customer_report_datamart)) or
+			(dp.load_dttm > (select coalesce (max(load_dttm), '1900-01-01') from dwh.load_dates_customer_report_datamart)) or
+			(t0.load_dttm > (select coalesce (max(load_dttm), '1900-01-01') from dwh.load_dates_customer_report_datamart))
+),
+dwh_delta_customer_update as (-- получаем перечень существующих в витрине customer_id, информацию по которым необходимо обновить
+select 
+dwh_delta_customer.exists_customer_id as exists_customer_id
+from dwh_delta_customer
+where exists_customer_id is not null
+),
+dwh_delta_customer_insert_result as(--получаем результирующую выборку для вставки новых строк
+select
+t2.customer_id as customer_id,
+t2.customer_name as customer_name,
+t2.customer_address as customer_address,
+t2.customer_birthday as customer_birthday,
+t2.customer_email as customer_email,
+t2.total_spend_money as total_spend_money,
+t2.platform_money as platform_money,
+t2.total_order_count_per_month as total_order_count_per_month,
+t2.avg_cost_one_order as avg_cost_one_order,
+t2.median_time_order_completed as median_time_order_completed,
+t3.product_type as top_product_category,
+t4.craftsman_id as top_popular_craftsman_id,
+t2.count_order_created as count_order_created,
+t2.count_order_in_progress as count_order_in_progress,
+t2.count_order_delivery as count_order_delivery,
+t2.count_order_done as count_order_done,
+t2.count_order_not_done as count_order_not_done,
+t2.report_period as report_period
+from (
+				select -- построчно + объединене
+				t1.customer_id as customer_id,
+				t1.customer_name as customer_name,
+				t1.customer_address as customer_address,
+				t1.customer_birthday as customer_birthday,
+				t1.customer_email as customer_email,
+				sum(t1.product_price) as total_spend_money,
+				sum(t1.product_price*0.1) as platform_money,
+				count(t1.product_price) as total_order_count_per_month,
+				(sum (t1.product_price)/count(t1.product_price)) as avg_cost_one_order,
+				percentile_cont(0.5) WITHIN GROUP(ORDER BY t1.diff_order_date) as median_time_order_completed,
+				count(t1.order_created_date) as count_order_created,
+				sum(case when t1.order_status = 'in progress' then 1 else 0 end) as count_order_in_progress,
+				sum(case when t1.order_status = 'delivery' then 1 else 0 end) as count_order_delivery,
+				sum(case when t1.order_status = 'done' then 1 else 0 end) as count_order_done,
+				sum(case when t1.order_status != 'done' then 1 else 0 end) as count_order_not_done,
+				t1.report_period as report_period
+				from dwh_delta_customer as t1
+					where t1.exists_customer_id is null
+					group by t1.customer_id, t1.customer_name, t1.customer_address, t1.customer_birthday, t1.customer_email, t1.report_period
+					order by report_period)
+				as t2
+				inner join (
+							select 
+							ddc.customer_id as customer_id_for_rank,
+							ddc.product_type as product_type,
+							count (ddc.product_id) as count_product,
+							ddc.product_id as product_id,
+							ddc.report_period as report_period_for_runk,
+							first_value (product_type)
+							over (partition by ddc.report_period order by (count (ddc.product_id)) desc) as top_product_type
+							from dwh_delta_customer ddc
+							group by ddc.customer_id, ddc.product_type, ddc.report_period, ddc.product_id
+							order by count_product desc) as t3 on t2.customer_id = t3.customer_id_for_rank and t2.report_period = t3.report_period_for_runk				
+				inner join (
+							select 
+							ddc.customer_id as customer_id_for_rank,
+							ddc.craftsman_id,
+							count(ddc.craftsman_id) as count_craftsman,
+							ddc.report_period as report_period_for_runk,
+							first_value (craftsman_id)
+							over (partition by ddc.report_period order by (count (ddc.craftsman_id)) desc) as top_craftsman_id
+							from dwh_delta_customer ddc
+							group by ddc.customer_id, ddc.craftsman_id, ddc.report_period
+							order by count_craftsman desc) as t4 on t2.customer_id = t4.customer_id_for_rank and t2.report_period = t4.report_period_for_runk
+),
+dwh_delta_customer_update_result as(--получаем результирующую выборку для обновления сущетвующих строк
+select
+t2.customer_id as customer_id,
+t2.customer_name as customer_name,
+t2.customer_address as customer_address,
+t2.customer_birthday as customer_birthday,
+t2.customer_email as customer_email,
+t2.total_spend_money as total_spend_money,
+t2.platform_money as platform_money,
+t2.total_order_count_per_month as total_order_count_per_month,
+t2.avg_cost_one_order as avg_cost_one_order,
+t2.median_time_order_completed as median_time_order_completed,
+t3.product_type as top_product_category,
+t4.craftsman_id as top_popular_craftsman_id,
+t2.count_order_created as count_order_created,
+t2.count_order_in_progress as count_order_in_progress,
+t2.count_order_delivery as count_order_delivery,
+t2.count_order_done as count_order_done,
+t2.count_order_not_done as count_order_not_done,
+t2.report_period as report_period
+from (
+				select -- построчно + объединене
+				t1.customer_id as customer_id,
+				t1.customer_name as customer_name,
+				t1.customer_address as customer_address,
+				t1.customer_birthday as customer_birthday,
+				t1.customer_email as customer_email,
+				sum(t1.product_price) as total_spend_money,
+				sum(t1.product_price*0.1) as platform_money,
+				count(t1.product_price) as total_order_count_per_month,
+				(sum (t1.product_price)/count(t1.product_price)) as avg_cost_one_order,
+				percentile_cont(0.5) WITHIN GROUP(ORDER BY t1.diff_order_date) as median_time_order_completed,
+				count(t1.order_created_date) as count_order_created,
+				sum(case when t1.order_status = 'in progress' then 1 else 0 end) as count_order_in_progress,
+				sum(case when t1.order_status = 'delivery' then 1 else 0 end) as count_order_delivery,
+				sum(case when t1.order_status = 'done' then 1 else 0 end) as count_order_done,
+				sum(case when t1.order_status != 'done' then 1 else 0 end) as count_order_not_done,
+				t1.report_period as report_period
+				from (
+						select
+						dc.customer_id as customer_id,
+						dc.customer_name as customer_name,
+						dc.customer_address as customer_address,
+						dc.customer_birthday as customer_birthday,
+						dc.customer_email as customer_email,
+						dc2.craftsman_id as craftsman_id,
+						dp.product_id as product_id,
+						dp.product_price as product_price,
+						dp.product_type as product_type,
+						ddcu.exists_customer_id as exists_customer_id,
+						t0.order_created_date as order_created_date,
+						to_char(t0.order_created_date, 'yyyy-mm') as report_period,
+						(t0.order_completion_date - t0.order_created_date) as diff_order_date,
+						t0.order_status as order_status,
+						dc.load_dttm  as customer_load_dttm,
+						dc2.load_dttm  as craftsman_load_dttm,
+						dp.load_dttm  as product_load_dttm
+						from dwh.f_order t0
+						inner join dwh.d_customer dc on t0.customer_id = dc.customer_id 
+						inner join dwh.d_craftsman dc2 on t0.craftsman_id = dc2.craftsman_id 
+						inner join dwh.d_product dp on t0.product_id = dp.product_id 
+						inner join dwh_delta_customer_update ddcu on t0.craftsman_id = ddcu.exists_customer_id
+						) 
+					as t1
+					where t1.exists_customer_id is not null
+					group by t1.customer_id, t1.customer_name, t1.customer_address, t1.customer_birthday, t1.customer_email, t1.report_period
+					order by report_period)
+				as t2
+				inner join (
+							select 
+							ddc.customer_id as customer_id_for_rank,
+							ddc.product_type as product_type,
+							count (ddc.product_id) as count_product,
+							ddc.product_id as product_id,
+							ddc.report_period as report_period_for_runk,
+							first_value (product_type)
+							over (partition by ddc.report_period order by (count (ddc.product_id)) desc) as top_product_type
+							from dwh_delta_customer ddc
+							group by ddc.customer_id, ddc.product_type, ddc.report_period, ddc.product_id
+							order by count_product desc) as t3 on t2.customer_id = t3.customer_id_for_rank and t2.report_period = t3.report_period_for_runk				
+				inner join (
+							select 
+							ddc.customer_id as customer_id_for_rank,
+							ddc.craftsman_id,
+							count(ddc.craftsman_id) as count_craftsman,
+							ddc.report_period as report_period_for_runk,
+							first_value (craftsman_id)
+							over (partition by ddc.report_period order by (count (ddc.craftsman_id)) desc) as top_craftsman_id
+							from dwh_delta_customer ddc
+							group by ddc.customer_id, ddc.craftsman_id, ddc.report_period
+							order by count_craftsman desc) as t4 on t2.customer_id = t4.customer_id_for_rank and t2.report_period = t4.report_period_for_runk
+),
+insert_delta as (--вставляем новые строки
+insert into dwh.customer_report_datamart (
+customer_id,
+customer_name,
+customer_address,
+customer_birthday,
+customer_email,
+total_spend_money,
+platform_money,
+total_order_count_per_month,
+avg_cost_one_order,
+median_time_order_completed,
+top_product_category,
+top_popular_craftsman_id,
+count_order_created,
+count_order_in_progress,
+count_order_delivery,
+count_order_done,
+count_order_not_done,
+report_period					
+)
+select
+customer_id,
+customer_name,
+customer_address,
+customer_birthday,
+customer_email,
+total_spend_money,
+platform_money,
+total_order_count_per_month,
+avg_cost_one_order,
+median_time_order_completed,
+top_product_category,
+top_popular_craftsman_id,
+count_order_created,
+count_order_in_progress,
+count_order_delivery,
+count_order_done,
+count_order_not_done,
+report_period		
+from dwh_delta_customer_insert_result
+),
+update_delta as (--обновляем существующие строки
+update dwh.customer_report_datamart set  
+customer_id = updates.customer_id,
+customer_name = updates.customer_name,
+customer_address = updates.customer_address,
+customer_birthday = updates.customer_birthday,
+customer_email = updates.customer_email,
+total_spend_money = updates.total_spend_money,
+platform_money = updates.platform_money,
+total_order_count_per_month = updates.total_order_count_per_month,
+avg_cost_one_order = updates.avg_cost_one_order,
+median_time_order_completed = updates.median_time_order_completed,
+top_product_category = updates.top_product_category,
+top_popular_craftsman_id = updates.top_popular_craftsman_id,
+count_order_created = updates.count_order_created,
+count_order_in_progress = updates.count_order_in_progress,
+count_order_delivery = updates.count_order_delivery,
+count_order_done = updates.count_order_done,
+count_order_not_done = updates.count_order_not_done,
+report_period = updates.report_period
+from (
+	select
+	*
+	from dwh_delta_customer_update_result
+	) as updates
+where dwh.customer_report_datamart.customer_id = updates.customer_id
+),
+insert_load_date as (--вставляем записб о последнем обновлении витрины
+insert into dwh.load_dates_customer_report_datamart (load_dttm)
+select 
+greatest (coalesce(max(customer_load_dttm), now()),
+		  coalesce(max(craftsman_load_dttm), now()),
+		  coalesce(max(product_load_dttm), now()))
+from dwh_delta_customer
+)
+SELECT 'increment datamart' as updates;
